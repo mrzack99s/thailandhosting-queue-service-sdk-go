@@ -3,7 +3,9 @@ package queueservice
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -86,5 +88,115 @@ func TestErrorsAndRetries(t *testing.T) {
 	var e *Error
 	if !IsNotFound(err) || !errors.As(err, &e) || e.Code != "queue_not_found" || e.Instance != "/th-bkk-1/v1/queues/missing" {
 		t.Fatalf("%#v", err)
+	}
+}
+
+// TestTokenSource sends a fresh token on every attempt, with no signature,
+// and long-polls with it.
+func TestTokenSource(t *testing.T) {
+	var answers atomic.Int32
+	var wait atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Signature") != "" || r.Header.Get("Signature-Input") != "" {
+			t.Errorf("signed with a token: %v", r.Header)
+		}
+		n := answers.Add(1)
+		if want := fmt.Sprintf("Bearer tok-%d", n); r.Header.Get("Authorization") != want {
+			t.Errorf("Authorization %q, want %q", r.Header.Get("Authorization"), want)
+		}
+		if strings.HasSuffix(r.URL.Path, "/receive") {
+			var in struct {
+				Wait int64 `json:"wait"`
+			}
+			json.NewDecoder(r.Body).Decode(&in)
+			wait.Store(in.Wait)
+			w.Write([]byte(`{"messages":[{"id":"m1","receipt":"r1","body":"hello"}]}`))
+			return
+		}
+		if n == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(503)
+			return
+		}
+		w.Write([]byte(`{"name":"jobs"}`))
+	}))
+	defer srv.Close()
+	var calls atomic.Int32
+	c, err := New(Config{Endpoint: srv.URL, TokenSource: func(ctx context.Context) (string, error) {
+		return fmt.Sprintf("tok-%d", calls.Add(1)), nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := c.GetQueue(ctx, "jobs"); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 2 || answers.Load() != 2 {
+		t.Fatalf("%d tokens for %d requests", calls.Load(), answers.Load())
+	}
+	msgs, err := c.Queue("jobs").Receive(ctx, &ReceiveOptions{Wait: 20 * time.Second})
+	if err != nil || len(msgs) != 1 || msgs[0].Body != "hello" || wait.Load() != 20 {
+		t.Fatalf("long poll: %+v %v, wait %d", msgs, err, wait.Load())
+	}
+}
+
+// TestTokenSourceFailure sends nothing, retries nothing and stops a worker.
+func TestTokenSourceFailure(t *testing.T) {
+	var answers atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		answers.Add(1)
+	}))
+	defer srv.Close()
+	boom := errors.New("boom")
+	var calls atomic.Int32
+	source := func(ctx context.Context) (string, error) {
+		calls.Add(1)
+		return "", boom
+	}
+	c, err := New(Config{Endpoint: srv.URL, TokenSource: source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := c.GetQueue(ctx, "jobs"); !errors.Is(err, ErrTokenSource) || !errors.Is(err, boom) || calls.Load() != 1 {
+		t.Fatalf("%v after %d calls", err, calls.Load())
+	}
+	// A worker outlives a token outage: it keeps trying until told to stop.
+	short, stop := context.WithTimeout(ctx, 700*time.Millisecond)
+	defer stop()
+	before := calls.Load()
+	err = c.Queue("jobs").Process(short, func(context.Context, Message) error { return nil }, nil)
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Process: %v", err)
+	}
+	if calls.Load() < before+2 {
+		t.Fatalf("Process stopped after %d calls", calls.Load()-before)
+	}
+	empty, _ := New(Config{Endpoint: srv.URL, TokenSource: func(context.Context) (string, error) { return "", nil }})
+	if _, err := empty.GetQueue(ctx, "jobs"); !errors.Is(err, ErrTokenSource) {
+		t.Fatalf("an empty token: %v", err)
+	}
+	if answers.Load() != 0 {
+		t.Fatalf("%d requests sent without a token", answers.Load())
+	}
+}
+
+func TestCredentialsAreExclusive(t *testing.T) {
+	source := func(context.Context) (string, error) { return "tok", nil }
+	for _, cfg := range []Config{
+		{},
+		{AccessKeyID: "k"},
+		{AccessKeyID: "k", SecretAccessKey: "s", TokenSource: source},
+		{AccessKeyID: "k", TokenSource: source},
+		{SecretAccessKey: "s", TokenSource: source},
+	} {
+		if _, err := New(cfg); err == nil {
+			t.Fatalf("accepted key %q, secret %q, source %v", cfg.AccessKeyID, cfg.SecretAccessKey, cfg.TokenSource != nil)
+		}
+	}
+	if _, err := New(Config{TokenSource: source}); err != nil {
+		t.Fatal(err)
 	}
 }

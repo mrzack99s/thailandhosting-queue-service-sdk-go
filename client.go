@@ -42,8 +42,9 @@ const Version = "1.0.0"
 // DefaultEndpoint is the Queue Service endpoint.
 const DefaultEndpoint = "https://queues.thailandhosting.com"
 
-// Config configures a Client. AccessKeyID and SecretAccessKey are
-// required; every other field has a sensible default.
+// Config configures a Client. Exactly one of AccessKeyID with
+// SecretAccessKey, or TokenSource, is required; every other field has a
+// sensible default.
 type Config struct {
 	// Endpoint is the Queue Service endpoint (default DefaultEndpoint). It
 	// may already end in a region, for example
@@ -57,6 +58,12 @@ type Config struct {
 	// (HTTP Message Signatures, RFC 9421, HMAC-SHA256); it is never sent.
 	AccessKeyID     string
 	SecretAccessKey string
+	// TokenSource, instead of an access key, gives a service account's
+	// short-lived token, sent as Authorization: Bearer with no signature. It
+	// is called before every attempt, retries included, so it should cache
+	// and refresh the token, and be safe for concurrent use. Its failure is
+	// returned wrapping ErrTokenSource and is not retried.
+	TokenSource func(ctx context.Context) (string, error)
 
 	// HTTPClient replaces the default client. Its Timeout, if any, must be
 	// longer than the longest receive wait (20 s).
@@ -70,11 +77,12 @@ type Config struct {
 
 const defaultMaxRetries = 4
 
-// Client talks to Queue Service with one access key.
+// Client talks to Queue Service with one access key or service account.
 type Client struct {
 	base      *url.URL // up to and including /v1
 	keyID     string
 	secret    string
+	tokens    func(ctx context.Context) (string, error)
 	http      *http.Client
 	retries   int
 	userAgent string
@@ -83,8 +91,12 @@ type Client struct {
 
 // New creates a Client.
 func New(cfg Config) (*Client, error) {
-	if cfg.AccessKeyID == "" || cfg.SecretAccessKey == "" {
-		return nil, errors.New("queueservice: AccessKeyID and SecretAccessKey are required")
+	if cfg.TokenSource != nil {
+		if cfg.AccessKeyID != "" || cfg.SecretAccessKey != "" {
+			return nil, errors.New("queueservice: give an access key or TokenSource, not both")
+		}
+	} else if cfg.AccessKeyID == "" || cfg.SecretAccessKey == "" {
+		return nil, errors.New("queueservice: AccessKeyID and SecretAccessKey, or TokenSource, are required")
 	}
 	endpoint := cfg.Endpoint
 	if endpoint == "" {
@@ -100,7 +112,7 @@ func New(cfg Config) (*Client, error) {
 	}
 	u.Path += "/v1"
 	u.RawPath = ""
-	c := &Client{base: u, keyID: cfg.AccessKeyID, secret: cfg.SecretAccessKey, http: cfg.HTTPClient, retries: cfg.MaxRetries, now: time.Now}
+	c := &Client{base: u, keyID: cfg.AccessKeyID, secret: cfg.SecretAccessKey, tokens: cfg.TokenSource, http: cfg.HTTPClient, retries: cfg.MaxRetries, now: time.Now}
 	if c.http == nil {
 		c.http = &http.Client{Transport: defaultTransport()}
 	}
@@ -126,6 +138,11 @@ func defaultTransport() *http.Transport {
 	t.ForceAttemptHTTP2 = true
 	return t
 }
+
+// ErrTokenSource is wrapped by the error of a call whose Config.TokenSource
+// failed or gave no token: nothing was sent. The source's own error is
+// wrapped too.
+var ErrTokenSource = errors.New("queueservice: token source failed")
 
 // Error is an error answer from the service, read from its Problem
 // Details (RFC 9457).
@@ -219,7 +236,18 @@ func (c *Client) once(ctx context.Context, method, path string, body []byte, out
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Content-Digest", contentDigest(body))
 	}
-	signRequest(req, c.keyID, c.secret, c.now())
+	if c.tokens != nil {
+		token, err := c.tokens(ctx)
+		if err != nil {
+			return 0, false, 0, fmt.Errorf("%w: %w", ErrTokenSource, err)
+		}
+		if token == "" {
+			return 0, false, 0, fmt.Errorf("%w: it gave no token", ErrTokenSource)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+	} else {
+		signRequest(req, c.keyID, c.secret, c.now())
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {

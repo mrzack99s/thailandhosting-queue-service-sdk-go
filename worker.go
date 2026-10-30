@@ -32,7 +32,8 @@ type ProcessOptions struct {
 // when set), and after the queue's MaxReceives it goes to its dead-letter
 // queue. Busy or unreachable service answers are retried with backoff;
 // errors that retrying cannot fix (a missing queue, a key that may not
-// receive) stop Process and are returned.
+// receive) stop Process and are returned. A failed Config.TokenSource is
+// retried too: the token may come back, and the worker should still be there.
 func (q *Queue) Process(ctx context.Context, handle func(ctx context.Context, m Message) error, opt *ProcessOptions) error {
 	o := ProcessOptions{}
 	if opt != nil {

@@ -44,6 +44,29 @@ err = jobs.Process(ctx, func(ctx context.Context, m queueservice.Message) error 
 Create access keys in the Console (Queue Service → Access keys). Reuse one
 `Client`: it is safe for concurrent use and keeps connections open.
 
+## Using a service account
+
+A program can use a service account's short-lived token instead of an access
+key. Get it with the identity SDK and pass `TokenSource` in place of the key:
+
+```go
+import identity "github.com/mrzack99s/thailandhosting-identity-sdk-go"
+
+cred, _ := identity.Default()
+client, err := queueservice.New(queueservice.Config{
+	Region:      "th-bkk-1",
+	TokenSource: cred.TokenSource(""),
+})
+```
+
+The account needs a grant on the queue, set in the Console. Creating,
+changing and deleting queues takes an access key allowed to manage them.
+
+`TokenSource` is called before every attempt, so a refreshed token is picked
+up. Give a key or a token source, not both. If it fails, nothing is sent or
+retried: the call returns an error wrapping `ErrTokenSource`, and `Process`
+stops and returns it.
+
 ## Receiving by hand
 
 ```go
