@@ -37,7 +37,7 @@ import (
 )
 
 // Version is the SDK version, sent in the User-Agent.
-const Version = "1.0.0"
+const Version = "1.1.1"
 
 // DefaultEndpoint is the Queue Service endpoint.
 const DefaultEndpoint = "https://queues.thailandhosting.com"
